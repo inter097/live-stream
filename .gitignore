@@ -1,0 +1,42 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Cloudflare Tunnel
+.cloudflared/
+*.tunnel.json
+cert.pem
+
+# Build
+dist/
+
+# Logs
+*.log
+logs/
+
+# Runtime
+*.pid
+*.sock
+.pid/
+
+# Python
+__pycache__/
+*.pyc
+
+# Backup
+*.bak
+*~
