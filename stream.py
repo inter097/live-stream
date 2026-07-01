@@ -2,8 +2,8 @@
 """
 stream.py — Universal screen capture streaming pipeline.
 
-One command captures your screen, transcodes to 3 HLS qualities
-(720p/480p/360p), and serves them via Python http.server + Cloudflare tunnel.
+One command captures your screen, transcodes to 2 HLS qualities
+(1080p/480p), and serves them via Python http.server + Cloudflare tunnel.
 
 Usage:
     python3 stream.py
@@ -28,6 +28,11 @@ HTTP_PORT = 8080
 TUNNEL_CONFIG = os.path.expanduser("~/.cloudflared/config.yml")
 TUNNEL_NAME = "live"
 LOG_FILE = "/tmp/stream.log"
+
+QUALITIES = [
+    ("1080", "1920:1080", "4500k", "5000k", "8000k"),
+    ("480", "854:480", "1400k", "1600k", "2800k"),
+]
 
 C_BLUE = "\033[94m"
 C_GREEN = "\033[92m"
@@ -231,13 +236,13 @@ def setup_symlinks():
 
     if os.path.exists(HLS_DIR):
         shutil.rmtree(HLS_DIR)
-    for q in ("480", "1080"):
+    for q, *_ in QUALITIES:
         os.makedirs(os.path.join(HLS_DIR, q))
 
     screen_dir = os.path.join(SERVE_DIR, "screen")
     os.makedirs(screen_dir, exist_ok=True)
 
-    for q in ("480", "1080"):
+    for q, *_ in QUALITIES:
         link = os.path.join(screen_dir, q)
         if os.path.islink(link) or os.path.exists(link):
             os.unlink(link)
@@ -248,7 +253,7 @@ def setup_symlinks():
 
 def cleanup_symlinks():
     screen_dir = os.path.join(SERVE_DIR, "screen")
-    for q in ("480", "1080"):
+    for q, *_ in QUALITIES:
         link = os.path.join(screen_dir, q)
         try:
             if os.path.islink(link):
@@ -330,16 +335,11 @@ def build_ffmpeg_cmd():
         log(f"  [FAIL] Unsupported OS: {os_name}", C_RED)
         sys.exit(1)
 
-    qualities = [
-        ("1080", "4500k", "5000k", "8000k"),
-        ("480", "1400k", "1600k", "2800k"),
-    ]
-
     cmd = ["ffmpeg"]
     cmd.extend(input_args)
     cmd.extend(["-filter_complex", filter_complex])
 
-    for res, bv, maxrate, bufsize in qualities:
+    for res, _, bv, maxrate, bufsize in QUALITIES:
         cmd.extend([
             "-map", f"[v{res}]",
             "-c:v", encoder,
@@ -361,7 +361,7 @@ def build_ffmpeg_cmd():
 
 
 def wait_for_hls(timeout=10):
-    m3u8 = os.path.join(HLS_DIR, "1080", "tv.m3u8")
+    m3u8 = os.path.join(HLS_DIR, QUALITIES[0][0], "tv.m3u8")
     for _ in range(timeout * 2):
         if os.path.isfile(m3u8) and os.path.getsize(m3u8) > 0:
             return True
