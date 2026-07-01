@@ -1,6 +1,6 @@
 # live-stream
 
-Self-hosted live streaming. Captura tu pantalla → 3 calidades HLS → sírvelo local o por Cloudflare tunnel. Sin OBS, sin Docker, sin VPS, sin compilar. Un solo archivo.
+Self-hosted live streaming. Captura tu pantalla → 2 calidades HLS → sírvelo local o por Cloudflare tunnel. Sin OBS, sin Docker, sin VPS, sin compilar. Un solo archivo.
 
 ```
 python3 stream.py
@@ -8,15 +8,15 @@ python3 stream.py
   ├── HTTP server (:8080, Python stdlib)
   ├── cloudflared tunnel → your-domain.com (HTTPS, opcional)
   └── ffmpeg (avfoundation / x11grab / gdigrab)
-        split=3 → 720p / 480p / 360p
+        split=2 → 1080p / 480p
         HLS → /tmp/hls-screen/
 ```
 
-- **3 calidades:** 360p (800k) / 480p (1400k) / 720p (2500k)
+- **2 calidades:** 480p (1400k) / 1080p (4500k)
 - **Latencia:** ~10–15s
 - **Costo:** $0
 - **Dependencias:** ffmpeg + python3
-- **CPU:** ~15–25% en Apple Silicon (3 transcodes libx264 ultrafast)
+- **CPU:** ~15–25% en Apple Silicon (2 transcodes libx264 ultrafast)
 - **Plataformas:** macOS / Linux / Windows
 - **Un solo archivo:** `stream.py` (orquestador + HTTP server + player HTML)
 
@@ -102,8 +102,8 @@ Open **https://stream.example.com** — HTTPS, no ports exposed, DDoS protected.
 │  1. Dep check: ffmpeg, python3                       │
 │  2. HTTP server on :8080 (ThreadingHTTPServer)       │
 │  3. Cloudflare tunnel (if cloudflared + config found)│
-│  4. Symlinks: serve/screen/{720,480,360} → hls dir   │
-│  5. ffmpeg: screen capture → split=3 → HLS output    │
+│  4. Symlinks: serve/screen/{1080,480} → hls dir      │
+│  5. ffmpeg: screen capture → split=2 → HLS output    │
 │  6. Health check: waits for tv.m3u8 before announcing│
 │  7. Reconnect: restarts ffmpeg with 2s cooldown      │
 │  8. Cleanup: SIGINT/SIGTERM kills only what it       │
@@ -121,7 +121,7 @@ Open **https://stream.example.com** — HTTPS, no ports exposed, DDoS protected.
 - `.ts` → 1h cache (immutable by filename)
 - CORS: `Access-Control-Allow-Origin: *`
 
-**Player** is HTML inline in `stream.py` — 3 `<a>` links to `.m3u8` files + vanilla JS status badge (EN VIVO / OFFLINE). No hls.js, no frameworks, no external files.
+**Player** is HTML inline in `stream.py` — 2 `<a>` links to `.m3u8` files + vanilla JS status badge (EN VIVO / OFFLINE). No hls.js, no frameworks, no external files.
 
 ---
 
@@ -137,7 +137,7 @@ Open **https://stream.example.com** — HTTPS, no ports exposed, DDoS protected.
 | HTML inline in Python string | No `player/` directory, no symlinks, no file I/O. HTML served from memory. |
 | Python, not bash | Cross-platform (Windows has no native bash). Robust signal handling. Clean finally-block cleanup. |
 | No Makefile / Docker / launchd | `python3 stream.py` = one command. Nothing to build, nothing to install, nothing to configure. |
-| `split=3` for 3 qualities | Single input → 3 outputs in one ffmpeg process. Consistent GOP across renditions. |
+| `split=2` for 2 qualities | Single input → 2 outputs in one ffmpeg process. Consistent GOP across renditions. |
 | GOP 60 frames (2s @ 30fps) | HLS segment = 4s = 2 GOPs. No scene change detection = no B-frames = no buffer holes. |
 
 ---
@@ -210,7 +210,7 @@ That's it. 3 files, 0 directories.
 
 - **No audio:** video only. System audio via BlackHole is future work.
 - **No auth:** anyone with the URL can watch (Cloudflare proxy doesn't authenticate).
-- **CPU-bound:** 3 simultaneous libx264 transcodes. ~15-25% CPU on M-series.
+- **CPU-bound:** 2 simultaneous libx264 transcodes. ~15-25% CPU on M-series.
 - **Single screen:** captures screen 0 only. Multi-monitor not supported.
 - **TCC permission:** macOS requires manual Screen Recording permission for ffmpeg.
 
