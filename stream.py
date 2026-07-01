@@ -74,14 +74,13 @@ PLAYER_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div id="status" class="status offline"><span class="dot"></span>OFFLINE</div>
-  <p><a href="/screen/720/tv.m3u8">720p</a></p>
+  <p><a href="/screen/1080/tv.m3u8">1080p</a></p>
   <p><a href="/screen/480/tv.m3u8">480p</a></p>
-  <p><a href="/screen/360/tv.m3u8">360p</a></p>
   <script>
     async function checkStatus() {
       const el = document.getElementById('status');
       try {
-        const r = await fetch('/screen/720/tv.m3u8', { method: 'HEAD' });
+        const r = await fetch('/screen/1080/tv.m3u8', { method: 'HEAD' });
         if (r.ok) {
           el.className = 'status live';
           el.innerHTML = '<span class="dot"></span>EN VIVO';
@@ -232,13 +231,13 @@ def setup_symlinks():
 
     if os.path.exists(HLS_DIR):
         shutil.rmtree(HLS_DIR)
-    for q in ("360", "480", "720"):
+    for q in ("480", "1080"):
         os.makedirs(os.path.join(HLS_DIR, q))
 
     screen_dir = os.path.join(SERVE_DIR, "screen")
     os.makedirs(screen_dir, exist_ok=True)
 
-    for q in ("360", "480", "720"):
+    for q in ("480", "1080"):
         link = os.path.join(screen_dir, q)
         if os.path.islink(link) or os.path.exists(link):
             os.unlink(link)
@@ -249,7 +248,7 @@ def setup_symlinks():
 
 def cleanup_symlinks():
     screen_dir = os.path.join(SERVE_DIR, "screen")
-    for q in ("360", "480", "720"):
+    for q in ("480", "1080"):
         link = os.path.join(screen_dir, q)
         try:
             if os.path.islink(link):
@@ -295,10 +294,9 @@ def build_ffmpeg_cmd():
     os_name = sys.platform
 
     filter_complex = (
-        "[0:v]split=3[v1][v2][v3];"
-        "[v1]fps=30,scale=1280:720[v720];"
-        "[v2]fps=30,scale=854:480[v480];"
-        "[v3]fps=30,scale=640:360[v360]"
+        "[0:v]split=2[v1][v2];"
+        "[v1]fps=30,scale=1920:1080[v1080];"
+        "[v2]fps=30,scale=854:480[v480]"
     )
 
     if os_name == "darwin":
@@ -333,9 +331,8 @@ def build_ffmpeg_cmd():
         sys.exit(1)
 
     qualities = [
-        ("720", "2500k", "2800k", "5000k"),
+        ("1080", "4500k", "5000k", "8000k"),
         ("480", "1400k", "1600k", "2800k"),
-        ("360", "800k",  "900k",  "1600k"),
     ]
 
     cmd = ["ffmpeg"]
@@ -364,7 +361,7 @@ def build_ffmpeg_cmd():
 
 
 def wait_for_hls(timeout=10):
-    m3u8 = os.path.join(HLS_DIR, "720", "tv.m3u8")
+    m3u8 = os.path.join(HLS_DIR, "1080", "tv.m3u8")
     for _ in range(timeout * 2):
         if os.path.isfile(m3u8) and os.path.getsize(m3u8) > 0:
             return True
