@@ -387,6 +387,20 @@ def main():
 
     log(f"\n{C_BOLD}  stream.py — screen capture pipeline{C_RESET}\n")
 
+    if proc_running("stream.py"):
+        my_pid = os.getpid()
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", "stream.py"],
+                capture_output=True, text=True,
+            )
+            other_pids = [int(p) for p in r.stdout.split() if int(p) != my_pid]
+            if other_pids:
+                log("  [FAIL] stream.py is already running. Stop it first with Ctrl+C.", C_RED)
+                sys.exit(1)
+        except (ValueError, OSError):
+            pass
+
     log("  [1/4] Checking dependencies...", C_BLUE)
     check_dependencies()
 
