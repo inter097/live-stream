@@ -420,7 +420,7 @@ def main():
     ffmpeg_proc = None
     try:
         while True:
-            ffmpeg_proc = subprocess.Popen(cmd)
+            ffmpeg_proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
             started_procs.append(ffmpeg_proc)
 
             if not wait_for_hls():
