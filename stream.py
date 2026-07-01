@@ -33,6 +33,7 @@ QUALITIES = [
     ("1080", "1920:1080", "4500k", "5000k", "8000k"),
     ("480", "854:480", "1400k", "1600k", "2800k"),
 ]
+# to add/remove a quality: edit QUALITIES + filter_complex in build_ffmpeg_cmd() + PLAYER_HTML links below
 
 C_BLUE = "\033[94m"
 C_GREEN = "\033[92m"
