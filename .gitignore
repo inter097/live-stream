@@ -45,3 +45,6 @@ auto.key
 # Backup
 *.bak
 *~
+
+# Local launcher (one-click)
+stream.command
