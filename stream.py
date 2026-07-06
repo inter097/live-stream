@@ -1,112 +1,239 @@
 #!/usr/bin/env python3
-"""
-stream.py — Universal screen capture streaming pipeline.
+"""stream.py — All-in-one WebRTC screen streaming (single file).
 
-One command captures your screen, transcodes to 2 HLS qualities
-(1080p/480p), and serves them via Python http.server + Cloudflare tunnel.
-
-Usage:
-    python3 stream.py
-
-Ctrl+C stops capture. Processes started by this script are cleaned up on exit.
+Serves static HTML, proxies HLS, runs MediaMTX + Cloudflare tunnel.
+Everything embedded: no .html or .yml files needed.
 """
 
 import http.server
 import os
-import re
-import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
-HLS_DIR = "/tmp/hls-screen"
-SERVE_DIR = "/tmp/streaming-serve"
-HTTP_PORT = 8080
+MEDIAMTX_BIN = "/opt/homebrew/bin/mediamtx"
+MEDIAMTX_RUNTIME_CONFIG = Path(__file__).parent / ".mediamtx.yml"
+MEDIAMTX_LOG = "/tmp/mediamtx.log"
+MEDIAMTX_HLS = "http://127.0.0.1:8888"
 TUNNEL_CONFIG = os.path.expanduser("~/.cloudflared/config.yml")
 TUNNEL_NAME = "live"
 LOG_FILE = "/tmp/stream.log"
+PUBLISH_PORT = 8080
 
-QUALITIES = [
-    ("1080", "1920:1080", "4500k", "5000k", "8000k"),
-    ("480", "854:480", "1400k", "1600k", "2800k"),
-]
-# to add/remove a quality: edit QUALITIES + filter_complex in build_ffmpeg_cmd() + PLAYER_HTML links below
-
-C_BLUE = "\033[94m"
+C_RED = "\033[91m"
 C_GREEN = "\033[92m"
 C_YELLOW = "\033[93m"
-C_RED = "\033[91m"
+C_BLUE = "\033[94m"
 C_BOLD = "\033[1m"
 C_RESET = "\033[0m"
 
-PLAYER_HTML = """<!DOCTYPE html>
+PUBLISH_URL = f"http://localhost:{PUBLISH_PORT}/publish.html"
+
+MEDIAMTX_YAML = """\
+logLevel: info
+api: yes
+apiAddress: :9997
+
+webrtcAddress: :8889
+webrtcEncryption: no
+webrtcAdditionalHosts: [127.0.0.1, localhost, tv.eliuth.dev]
+
+hlsAddress: :8888
+hlsEncryption: no
+hlsAlwaysRemux: yes
+hlsSegmentDuration: 6s
+hlsPartDuration: 200ms
+hlsMuxerCloseAfter: 60000ms
+
+paths:
+  live:
+    source: publisher
+"""
+
+INDEX_HTML = """\
+<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Live Stream</title>
+  <meta charset="UTF-8">
+  <title>tv.eliuth.dev</title>
   <style>
-    body {
-      background: #0f172a; color: #e2e8f0;
-      font-family: system-ui, sans-serif;
-      min-height: 100vh; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; gap: 1.5rem;
-    }
-    a {
-      font-size: 1.5rem; font-weight: 700; color: #38bdf8;
-      text-decoration: none; padding: 0.5rem 2rem;
-      border: 2px solid #334155; border-radius: 8px;
-      transition: all 0.15s;
-    }
-    a:hover { border-color: #38bdf8; background: #1e293b; }
-    .status {
-      font-size: 1rem; font-weight: 600; letter-spacing: 0.05em;
-      padding: 0.4rem 1.2rem; border-radius: 6px;
-    }
-    .live { background: #dc2626; color: #fff; }
-    .offline { background: #334155; color: #94a3b8; }
-    .dot {
-      display: inline-block; width: 8px; height: 8px;
-      border-radius: 50%; margin-right: 6px;
-      animation: pulse 1.5s infinite;
-    }
-    .live .dot { background: #fff; }
-    .offline .dot { background: #64748b; animation: none; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif;
+           display: flex; flex-direction: column; align-items: center;
+           justify-content: center; min-height: 100vh; gap: 1rem; margin: 0; padding: 1rem; }
+    h1 { margin: 0; font-size: 1.2rem; font-weight: 600; color: #94a3b8; }
+    video { max-width: 95%; max-height: 85vh; border-radius: 8px; background: #000; }
+    .offline { color: #64748b; }
   </style>
 </head>
 <body>
-  <div id="status" class="status offline"><span class="dot"></span>OFFLINE</div>
-  <p><a href="/screen/1080/tv.m3u8">1080p</a></p>
-  <p><a href="/screen/480/tv.m3u8">480p</a></p>
+  <h1 id="status">tv.eliuth.dev</h1>
+  <video id="player" controls autoplay muted playsinline></video>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13"></script>
   <script>
-    async function checkStatus() {
-      const el = document.getElementById('status');
-      try {
-        const r = await fetch('/screen/1080/tv.m3u8', { method: 'HEAD' });
-        if (r.ok) {
-          el.className = 'status live';
-          el.innerHTML = '<span class="dot"></span>EN VIVO';
-        } else {
-          el.className = 'status offline';
-          el.innerHTML = '<span class="dot"></span>OFFLINE';
-        }
-      } catch {
-        el.className = 'status offline';
-        el.innerHTML = '<span class="dot"></span>OFFLINE';
+    const v = document.getElementById('player');
+    const status = document.getElementById('status');
+    const src = '/live/index.m3u8';
+
+    function setup() {
+      if (v.canPlayType('application/vnd.apple.mpegurl')) {
+        v.src = src;
+      } else if (Hls.isSupported()) {
+        const h = new Hls();
+        h.loadSource(src);
+        h.attachMedia(v);
       }
     }
-    checkStatus();
-    setInterval(checkStatus, 5000);
+
+    async function check() {
+      try {
+        const r = await fetch(src, { method: 'HEAD' });
+        if (r.ok) {
+          status.textContent = 'tv.eliuth.dev — EN VIVO';
+          status.className = '';
+          if (!v.src && !v.srcObject) setup();
+        } else {
+          status.textContent = 'tv.eliuth.dev — OFFLINE (publisher no conectado)';
+          status.className = 'offline';
+        }
+      } catch {
+        status.textContent = 'tv.eliuth.dev — OFFLINE';
+        status.className = 'offline';
+      }
+    }
+
+    check();
+    setInterval(check, 5000);
+    setup();
   </script>
 </body>
-</html>"""
+</html>
+"""
 
-started_procs = []
-we_started = {"tunnel": False}
+PUBLISH_HTML = """\
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Stream Publisher</title>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif;
+           display: flex; flex-direction: column; align-items: center;
+           justify-content: center; min-height: 100vh; gap: 1rem; margin: 0; padding: 1rem; }
+    h1 { margin: 0; }
+    button { padding: 1rem 2rem; font-size: 1.2rem; font-weight: 700;
+             background: #dc2626; color: white; border: none; border-radius: 8px;
+             cursor: pointer; }
+    button.stop { background: #475569; }
+    button:disabled { background: #334155; cursor: not-allowed; }
+    #local { max-width: 80%; max-height: 50vh; border-radius: 8px; background: #000; }
+    #status { font-size: 0.9rem; padding: 0.4rem 1rem; border-radius: 6px;
+              background: #334155; color: #94a3b8; }
+    #status.live { background: #16a34a; color: white; }
+    .hint { font-size: 0.8rem; color: #64748b; max-width: 600px; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1>🎥 Stream Publisher</h1>
+  <div id="status">OFFLINE</div>
+  <button id="start">Start Stream</button>
+  <video id="local" autoplay muted playsinline></video>
+  <p class="hint">En el picker de macOS, selecciona tu pantalla y marca ☑ <b>Share audio</b></p>
+
+  <script>
+    const btn = document.getElementById('start');
+    const status = document.getElementById('status');
+    const local = document.getElementById('local');
+    let pc = null;
+    let stream = null;
+
+    btn.onclick = async () => {
+      if (pc) {
+        pc.close();
+        pc = null;
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        local.srcObject = null;
+        status.textContent = 'OFFLINE';
+        status.className = '';
+        btn.textContent = 'Start Stream';
+        btn.className = '';
+        return;
+      }
+      btn.disabled = true;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: 24, width: { ideal: 1920 }, height: { ideal: 1080 } },
+          audio: true
+        });
+      } catch (e) {
+        alert('Permiso denegado o cancelado');
+        btn.disabled = false;
+        return;
+      }
+      local.srcObject = stream;
+
+      stream.getVideoTracks()[0].onended = () => {
+        if (pc) { pc.close(); pc = null; }
+        status.textContent = 'OFFLINE';
+        status.className = '';
+        btn.textContent = 'Start Stream';
+        btn.className = '';
+        btn.disabled = false;
+      };
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+      const videoTransceivers = pc.getTransceivers().filter(t =>
+        t.sender && t.sender.track && t.sender.track.kind === 'video'
+      );
+      if (videoTransceivers.length > 0) {
+        const caps = RTCRtpSender.getCapabilities('video');
+        const h264 = caps.codecs.filter(c =>
+          c.mimeType === 'video/H264' &&
+          (c.sdpFmtpLine || '').includes('level-asymmetry-allowed=1')
+        );
+        if (h264.length > 0) {
+          videoTransceivers[0].setCodecPreferences(h264);
+        }
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const res = await fetch('http://localhost:8889/live/whip', {
+        method: 'POST',
+        body: offer.sdp,
+        headers: { 'Content-Type': 'application/sdp' }
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        alert('MediaMTX WHIP failed: ' + res.status + ' - ' + txt);
+        btn.disabled = false;
+        return;
+      }
+      const answer = await res.text();
+      await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+
+      status.textContent = 'EN VIVO';
+      status.className = 'live';
+      btn.textContent = 'Stop Stream';
+      btn.className = 'stop';
+      btn.disabled = false;
+    };
+  </script>
+</body>
+</html>
+"""
+
+started = []
 
 
 def log(msg, color=C_RESET):
@@ -114,268 +241,120 @@ def log(msg, color=C_RESET):
     print(line)
     try:
         with open(LOG_FILE, "a") as f:
-            f.write(re.sub(r"\033\[[0-9;]*m", "", line) + "\n")
+            f.write(msg + "\n")
     except OSError:
         pass
 
 
-def port_open(port, host="127.0.0.1"):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            s.connect((host, port))
-            return True
-    except (ConnectionRefusedError, TimeoutError, OSError):
-        return False
-
-
-def proc_running(pattern):
-    try:
-        r = subprocess.run(
-            ["pgrep", "-f", pattern],
-            capture_output=True, text=True,
-        )
-        return r.returncode == 0
-    except FileNotFoundError:
-        return False
-
-
-def check_dependencies():
-    missing = []
-    for dep in ("ffmpeg", "python3"):
-        if not shutil.which(dep):
-            missing.append(dep)
-    if missing:
-        log(f"  [FAIL] Missing dependencies: {', '.join(missing)}", C_RED)
-        log(f"         Install with: brew install {' '.join(missing)}", C_RED)
-        sys.exit(1)
-    log("  [OK] Dependencies: ffmpeg, python3", C_GREEN)
-
-
-class CacheHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=SERVE_DIR, **kwargs)
-
+class StreamHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(PLAYER_HTML.encode("utf-8"))
-            return
-        super().do_GET()
+        self._handle(send_body=True)
 
-    def end_headers(self):
-        path = self.path.split("?")[0]
+    def do_HEAD(self):
+        self._handle(send_body=False)
+
+    def _handle(self, send_body):
+        if self.path == "/" or self.path == "/index.html":
+            self._serve_html(INDEX_HTML, send_body)
+        elif self.path == "/publish.html":
+            self._serve_html(PUBLISH_HTML, send_body)
+        elif self.path.startswith("/live/") or self.path == "/live":
+            self._proxy_to_mediamtx(send_body)
+        else:
+            self.send_error(404)
+
+    def _serve_html(self, body, send_body=True):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Access-Control-Allow-Origin", "*")
-        if path.endswith(".m3u8"):
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        elif path.endswith(".ts"):
-            self.send_header("Cache-Control", "public, max-age=3600")
-        super().end_headers()
+        body_bytes = body.encode("utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body_bytes)
+
+    def _proxy_to_mediamtx(self, send_body=True):
+        url = f"{MEDIAMTX_HLS}{self.path}"
+        try:
+            req = urllib.request.Request(url, method="HEAD" if not send_body else "GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.send_response(resp.status)
+                for header, value in resp.headers.items():
+                    if header.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(header, value)
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(resp.read())
+        except urllib.error.HTTPError as e:
+            self.send_response(e.code)
+            self.end_headers()
+            if send_body:
+                self.wfile.write(e.read())
+        except Exception as e:
+            self.send_error(502, f"Proxy error: {e}")
 
     def log_message(self, fmt, *args):
         pass
 
 
-def start_http_server():
-    if port_open(HTTP_PORT):
-        log(f"  [OK] HTTP server already running on :{HTTP_PORT}", C_GREEN)
-        return
-
-    os.makedirs(SERVE_DIR, exist_ok=True)
-    server = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", HTTP_PORT), CacheHandler
-    )
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-    for _ in range(10):
-        if port_open(HTTP_PORT):
-            log(f"  [OK] HTTP server started on :{HTTP_PORT}", C_GREEN)
-            return
-        time.sleep(0.5)
-    log("  [FAIL] HTTP server did not start", C_RED)
-    sys.exit(1)
+class ReusableHTTPServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
 
 
-def ensure_tunnel():
-    if proc_running("cloudflared.*tunnel.*run.*live"):
-        log("  [OK] Cloudflare tunnel already running", C_GREEN)
-        return
-
-    if not shutil.which("cloudflared"):
-        log("  [WARN] cloudflared not found — local only", C_YELLOW)
-        log(f"         Stream at http://localhost:{HTTP_PORT}/", C_YELLOW)
-        return
-
-    if not os.path.isfile(TUNNEL_CONFIG):
-        log(f"  [WARN] Tunnel config not found ({TUNNEL_CONFIG})", C_YELLOW)
-        log(f"         Stream at http://localhost:{HTTP_PORT}/", C_YELLOW)
-        return
-
-    log("  [..] Starting Cloudflare tunnel...", C_YELLOW)
-    p = subprocess.Popen(
-        ["cloudflared", "tunnel", "--config", TUNNEL_CONFIG, "run", TUNNEL_NAME],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    started_procs.append(p)
-    we_started["tunnel"] = True
-    time.sleep(3)
-    if p.poll() is None:
-        log(f"  [OK] Cloudflare tunnel started (pid={p.pid})", C_GREEN)
-    else:
-        log("  [WARN] Tunnel failed — local only", C_YELLOW)
-        log(f"         Stream at http://localhost:{HTTP_PORT}/", C_YELLOW)
-
-
-def setup_symlinks():
-    os.makedirs(SERVE_DIR, exist_ok=True)
-
-    if os.path.exists(HLS_DIR):
-        shutil.rmtree(HLS_DIR)
-    for q, *_ in QUALITIES:
-        os.makedirs(os.path.join(HLS_DIR, q))
-
-    screen_dir = os.path.join(SERVE_DIR, "screen")
-    os.makedirs(screen_dir, exist_ok=True)
-
-    for q, *_ in QUALITIES:
-        link = os.path.join(screen_dir, q)
-        if os.path.islink(link) or os.path.exists(link):
-            os.unlink(link)
-        os.symlink(os.path.join(HLS_DIR, q), link)
-
-    log(f"  [OK] Symlinks ready ({SERVE_DIR}/screen/ -> {HLS_DIR}/)", C_GREEN)
-
-
-def cleanup_symlinks():
-    screen_dir = os.path.join(SERVE_DIR, "screen")
-    for q, *_ in QUALITIES:
-        link = os.path.join(screen_dir, q)
+def kill_previous_instance():
+    """Kill any leftover stream.py / mediamtx / cloudflared from prior runs."""
+    for pattern in ("stream.py", "mediamtx", "cloudflared"):
         try:
-            if os.path.islink(link):
-                os.unlink(link)
-        except OSError:
+            subprocess.run(["pkill", "-9", "-f", pattern],
+                           capture_output=True, timeout=2)
+        except subprocess.TimeoutExpired:
             pass
+    for port in (8080, 8888, 8889, 9997):
+        try:
+            r = subprocess.run(["lsof", f"-ti:{port}"],
+                               capture_output=True, text=True, timeout=2)
+            for pid in r.stdout.strip().split():
+                try:
+                    os.kill(int(pid), 9)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    time.sleep(0.5)
+
+
+def start_publish_server():
+    kill_previous_instance()
+    server = ReusableHTTPServer(("127.0.0.1", PUBLISH_PORT), StreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def write_mediamtx_config():
+    MEDIAMTX_RUNTIME_CONFIG.write_text(MEDIAMTX_YAML)
+
+
+def cleanup(*_):
+    log("\n  Stopping...", C_YELLOW)
+    for p in started:
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:
+            p.kill()
     try:
-        if os.path.isdir(screen_dir) and not os.listdir(screen_dir):
-            os.rmdir(screen_dir)
-    except OSError:
-        pass
-
-
-def cleanup_started_procs():
-    for p in started_procs:
-        if p.poll() is None:
-            try:
-                p.send_signal(signal.SIGINT)
-                p.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError):
-                p.kill()
-                p.wait()
-    cleanup_symlinks()
-
-
-def detect_screen_index_macos():
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in r.stderr.splitlines():
-            if "capture screen" in line.lower():
-                m = re.search(r"\[(\d+)\]", line)
-                if m:
-                    return m.group(1)
+        MEDIAMTX_RUNTIME_CONFIG.unlink(missing_ok=True)
     except Exception:
         pass
-    return "2"
-
-
-def build_ffmpeg_cmd():
-    os_name = sys.platform
-
-    filter_complex = (
-        "[0:v]split=2[v1][v2];"
-        "[v1]fps=30,scale=1920:1080[v1080];"
-        "[v2]fps=30,scale=854:480[v480]"
-    )
-
-    if os_name == "darwin":
-        idx = detect_screen_index_macos()
-        encoder = "libx264"
-        extra_enc = ["-preset", "ultrafast"]
-        input_args = [
-            "-f", "avfoundation",
-            "-framerate", "30",
-            "-capture_cursor", "1",
-            "-capture_mouse_clicks", "1",
-            "-i", f"{idx}:none",
-        ]
-    elif os_name.startswith("linux"):
-        encoder = "libx264"
-        extra_enc = ["-preset", "ultrafast"]
-        input_args = [
-            "-f", "x11grab",
-            "-framerate", "25",
-            "-i", ":0.0",
-        ]
-    elif os_name in ("win32", "cygwin"):
-        encoder = "libx264"
-        extra_enc = ["-preset", "ultrafast"]
-        input_args = [
-            "-f", "gdigrab",
-            "-framerate", "30",
-            "-i", "desktop",
-        ]
-    else:
-        log(f"  [FAIL] Unsupported OS: {os_name}", C_RED)
-        sys.exit(1)
-
-    cmd = ["ffmpeg"]
-    cmd.extend(input_args)
-    cmd.extend(["-filter_complex", filter_complex])
-
-    for res, _, bv, maxrate, bufsize in QUALITIES:
-        cmd.extend([
-            "-map", f"[v{res}]",
-            "-c:v", encoder,
-        ])
-        cmd.extend(extra_enc)
-        cmd.extend([
-            "-pix_fmt", "yuv420p",
-            "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
-            "-b:v", bv, "-maxrate", maxrate, "-bufsize", bufsize,
-            "-f", "hls",
-            "-hls_time", "4",
-            "-hls_list_size", "6",
-            "-hls_flags", "delete_segments",
-            "-hls_segment_filename", f"{HLS_DIR}/{res}/tv_%03d.ts",
-            f"{HLS_DIR}/{res}/tv.m3u8",
-        ])
-
-    return cmd
-
-
-def wait_for_hls(timeout=10):
-    m3u8 = os.path.join(HLS_DIR, QUALITIES[0][0], "tv.m3u8")
-    for _ in range(timeout * 2):
-        if os.path.isfile(m3u8) and os.path.getsize(m3u8) > 0:
-            return True
-        time.sleep(0.5)
-    return False
-
-
-def _sigterm_handler(signum, frame):
-    raise KeyboardInterrupt
+    log(f"  Done. Logs at {LOG_FILE} | {MEDIAMTX_LOG}\n", C_GREEN)
+    sys.exit(0)
 
 
 def main():
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
 
     try:
         with open(LOG_FILE, "w") as f:
@@ -383,76 +362,65 @@ def main():
     except OSError:
         pass
 
-    log(f"\n{C_BOLD}  stream.py — screen capture pipeline{C_RESET}\n")
+    log(f"\n{C_BOLD}  stream.py — WebRTC screen streaming{C_RESET}\n")
 
-    if proc_running("stream.py"):
-        my_pid = os.getpid()
-        try:
-            r = subprocess.run(
-                ["pgrep", "-f", "stream.py"],
-                capture_output=True, text=True,
-            )
-            other_pids = [int(p) for p in r.stdout.split() if int(p) != my_pid]
-            if other_pids:
-                log("  [FAIL] stream.py is already running. Stop it first with Ctrl+C.", C_RED)
-                sys.exit(1)
-        except (ValueError, OSError):
-            pass
+    if not Path(MEDIAMTX_BIN).exists():
+        log(f"  [FAIL] mediamtx not found at {MEDIAMTX_BIN}", C_RED)
+        log(f"         Install: brew install mediamtx", C_RED)
+        sys.exit(1)
 
-    log("  [1/4] Checking dependencies...", C_BLUE)
-    check_dependencies()
+    log(f"  [1/3] Starting publish server on :{PUBLISH_PORT} (with HLS proxy)...", C_BLUE)
+    start_publish_server()
+    log(f"  [OK] Publish page: {PUBLISH_URL}", C_GREEN)
+    log(f"  [OK] HLS proxy:    /live/* → MediaMTX :8888", C_GREEN)
 
-    log("  [2/4] Starting HTTP server...", C_BLUE)
-    start_http_server()
+    log("  [2/3] Starting MediaMTX...", C_BLUE)
+    write_mediamtx_config()
+    mtx_log = open(MEDIAMTX_LOG, "w")
+    mtx = subprocess.Popen(
+        [MEDIAMTX_BIN, str(MEDIAMTX_RUNTIME_CONFIG)],
+        stdout=mtx_log,
+        stderr=subprocess.STDOUT,
+    )
+    started.append(mtx)
+    time.sleep(2)
+    if mtx.poll() is not None:
+        log(f"  [FAIL] MediaMTX failed. Check {MEDIAMTX_LOG}", C_RED)
+        sys.exit(1)
+    log(f"  [OK] MediaMTX running (HLS :8888, WebRTC :8889, API :9997)", C_GREEN)
 
-    log("  [3/4] Checking Cloudflare tunnel...", C_BLUE)
-    ensure_tunnel()
+    log("  [3/3] Starting Cloudflare tunnel...", C_BLUE)
+    if os.path.isfile(TUNNEL_CONFIG):
+        t = subprocess.Popen(
+            ["cloudflared", "tunnel", "--config", TUNNEL_CONFIG, "run", TUNNEL_NAME],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        started.append(t)
+        time.sleep(3)
+        log(f"  [OK] Tunnel started", C_GREEN)
+    else:
+        log(f"  [WARN] Tunnel config not found, local only", C_YELLOW)
 
-    log("  [4/4] Setting up symlinks + launching ffmpeg...", C_BLUE)
-    setup_symlinks()
-
-    if sys.platform == "darwin":
-        log(f"\n  {C_YELLOW}[WARN] If screen is black:{C_RESET}", C_YELLOW)
-        log(f"  {C_YELLOW}  System Preferences > Privacy & Security > Screen Recording{C_RESET}", C_YELLOW)
-        log(f"  {C_YELLOW}  -> Add /opt/homebrew/bin/ffmpeg{C_RESET}\n", C_YELLOW)
-
-    cmd = build_ffmpeg_cmd()
-
-    ffmpeg_proc = None
+    log("  Opening publish page in browser...", C_BLUE)
     try:
-        while True:
-            ffmpeg_proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
-            started_procs.append(ffmpeg_proc)
+        subprocess.Popen(["open", "http://localhost:8080/publish.html"])
+        log(f"  [OK] Browser opened → {PUBLISH_URL}", C_GREEN)
+    except Exception as e:
+        log(f"  [WARN] Could not open browser: {e}", C_YELLOW)
+        log(f"         Open manually: {PUBLISH_URL}", C_YELLOW)
 
-            if not wait_for_hls():
-                log("  [WARN] HLS not generating — check ffmpeg permissions", C_YELLOW)
-            else:
-                log(f"\n{C_BOLD}  Streaming at:{C_RESET}")
-                log(f"  {C_GREEN}http://localhost:{HTTP_PORT}/{C_RESET}")
-                if we_started["tunnel"]:
-                    log(f"  {C_GREEN}(tunnel active — your domain is live){C_RESET}")
-                log(f"\n{C_BOLD}  Ctrl+C to stop.{C_RESET}\n")
+    log("\n  ─────────────────────────────────────────", C_BOLD)
+    log(f"  {C_BOLD}1. Open in browser:{C_RESET}  {C_GREEN}{PUBLISH_URL}{C_RESET}")
+    log(f"  {C_BOLD}2. Click 'Start Stream' → pick screen + ☑ Share audio{C_RESET}")
+    log(f"  {C_BOLD}3. Public stream:{C_RESET}    {C_GREEN}https://tv.eliuth.dev/{C_RESET}")
+    log("  ─────────────────────────────────────────\n", C_BOLD)
+    log(f"  {C_BOLD}Ctrl+C to stop.{C_RESET}\n")
 
-            exit_code = ffmpeg_proc.wait()
-            log(f"  [WARN] ffmpeg exited (code={exit_code}) — restarting in 2s (Ctrl+C to stop)", C_YELLOW)
-            time.sleep(2)
-
+    try:
+        mtx.wait()
     except KeyboardInterrupt:
-        log(f"\n  {C_YELLOW}Stopping...{C_RESET}")
-        if ffmpeg_proc and ffmpeg_proc.poll() is None:
-            ffmpeg_proc.send_signal(signal.SIGINT)
-            try:
-                ffmpeg_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                ffmpeg_proc.kill()
-                ffmpeg_proc.wait()
-    finally:
-        cleanup_started_procs()
-        if we_started["tunnel"]:
-            log(f"  {C_GREEN}Stopped: tunnel + ffmpeg.{C_RESET}")
-        else:
-            log(f"  {C_GREEN}Done. Tunnel was pre-existing, still running.{C_RESET}")
-        log(f"  {C_GREEN}Logs at {LOG_FILE}{C_RESET}\n")
+        cleanup()
 
 
 if __name__ == "__main__":

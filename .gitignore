@@ -37,6 +37,11 @@ logs/
 __pycache__/
 *.pyc
 
+# MediaMTX (auto-generated MoQ certs)
+auto.crt
+auto.key
+.mediamtx.yml
+
 # Backup
 *.bak
 *~
